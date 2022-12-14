@@ -1,0 +1,7 @@
+type Query {
+  runQuery: String
+  stackAQuery: String
+  stackBQuery: String
+}
+
+type Mutation {}

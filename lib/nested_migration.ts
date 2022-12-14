@@ -1,132 +1,238 @@
 #!/usr/bin/env node
 
 import 'source-map-support/register';
-import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import * as sqs from 'aws-cdk-lib/aws-sqs';
-import * as sns from 'aws-cdk-lib/aws-sns';
-import * as appsync from 'aws-cdk-lib/aws-appsync';
+import {
+  Stack,
+  StackProps,
+  NestedStack,
+  NestedStackProps,
+  App,
+  aws_s3 as s3,
+  aws_appsync as l1appsync
+} from 'aws-cdk-lib';
+import * as l2appsync from '@aws-cdk/aws-appsync-alpha'
+import { AuthorizationType, BaseDataSource, IGraphqlApi, MappingTemplate, Schema } from '@aws-cdk/aws-appsync-alpha';
+import * as path from 'path';
 
-//
-// Initial State
-//
-// cdk-app/
-// ├─ appsync-stack/
-// │  ├─ appsync-api
-// │  ├─ nested-resolver-stack-a/
-// │  │  ├─ appsync-resolver
-// │  ├─ nested-resolver-stack-b/
-// ├─ event-stack/
-// │  ├─ nested-queue-stack-a/
-// │  │  ├─ sqs-queue
-// │  ├─ nested-queue-stack-b/
-//
-// Second Deployment State
-//
-// cdk-app/
-// ├─ appsync-stack/
-// │  ├─ appsync-api
-// │  ├─ nested-resolver-stack-a/
-// │  ├─ nested-resolver-stack-b/
-// │  │  ├─ appsync-resolver
-// ├─ event-stack/
-// │  ├─ nested-queue-stack-a/
-// │  ├─ nested-queue-stack-b/
-// │  │  ├─ sqs-queue
-//
-
+// Toggle this flag to test the migration process for the various stacks here.
 const IS_INITIAL_STATE = true;
 
-const createResolver = (scope: Construct, apiId: string) => new appsync.CfnResolver(scope, 'AttachedResolver', {
-  apiId,
-  typeName: 'Query',
-  fieldName: 'runQuery',
-  dataSourceName: 'NONE_DS',
-  requestMappingTemplate: '{}',
-  responseMappingTemplate: '$util.toJson({})',
-});
+/********************
+ * L1 AppSync Repro *
+ ********************/
 
-const createQueue = (scope: Construct) => new sqs.Queue(scope, 'AttachedQueue', {});
-
-interface NestedResolverStackProps extends cdk.StackProps {
+interface L1NestedResolverStackProps extends NestedStackProps {
   shouldCreateResolver: boolean;
   apiId: string;
+  dataSourceName: string;
+  persistentFieldName: string;
 }
 
-class NestedResolverStack extends cdk.NestedStack {
-  constructor(scope: Construct, id: string, props: NestedResolverStackProps) {
+class L1NestedResolverStack extends NestedStack {
+  constructor(scope: Construct, id: string, props: L1NestedResolverStackProps) {
     super(scope, id, props);
 
-    if (props.shouldCreateResolver) createResolver(this, props.apiId);
+    new l1appsync.CfnResolver(this, `AttachedResolver${props.persistentFieldName}`, {
+      apiId: props.apiId,
+      typeName: 'Query',
+      fieldName: props.persistentFieldName,
+      dataSourceName: props.dataSourceName,
+      requestMappingTemplate: '{}',
+      responseMappingTemplate: '$util.toJson({})',
+    });
+
+    if (props.shouldCreateResolver) {
+      new l1appsync.CfnResolver(this, `AttachedResolverrunQuery`, {
+        apiId: props.apiId,
+        typeName: 'Query',
+        fieldName: 'runQuery',
+        dataSourceName: props.dataSourceName,
+        requestMappingTemplate: '{}',
+        responseMappingTemplate: '$util.toJson({})',
+      });
+    }
   }
 }
 
-class AppSyncStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+class L1AppSyncStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
 
-    const api = new appsync.CfnGraphQLApi(this, 'API', {
+    const api = new l1appsync.CfnGraphQLApi(this, 'API', {
       authenticationType: 'API_KEY',
       name: 'cdkBasedAPI',
     });
 
-    new appsync.CfnGraphQLSchema(this, 'Schema', {
+    new l1appsync.CfnGraphQLSchema(this, 'Schema', {
       apiId: api.attrApiId,
       definition: /* GraphQL */ `
       type Query {
         runQuery: String
+        stackAQuery: String
+        stackBQuery: String
       }
 
       type Mutation {}
       `
     });
 
-    new appsync.CfnApiKey(this, 'ApiKey', {
+    new l1appsync.CfnApiKey(this, 'ApiKey', {
       apiId: api.attrApiId,
     });
 
-    new appsync.CfnDataSource(this, 'DataSource', {
+    const dataSource = new l1appsync.CfnDataSource(this, 'DataSource', {
       apiId: api.attrApiId,
       name: 'NONE_DS',
       type: 'NONE',
     });
 
-    new NestedResolverStack(this, 'NestedResolverStackA', {
+    new L1NestedResolverStack(this, 'L1NestedResolverStackA', {
       shouldCreateResolver: IS_INITIAL_STATE,
       apiId: api.attrApiId,
+      dataSourceName: dataSource.attrName,
+      persistentFieldName: 'stackAQuery',
     });
-    new NestedResolverStack(this, 'NestedResolverStackB', {
+    new L1NestedResolverStack(this, 'L1NestedResolverStackB', {
       shouldCreateResolver: !IS_INITIAL_STATE,
       apiId: api.attrApiId,
+      dataSourceName: dataSource.attrName,
+      persistentFieldName: 'stackBQuery',
     });  }
 }
 
-interface NestedQueueStackProps extends cdk.StackProps {
-  shouldCreateResource: boolean;
+/********************
+ * L2 AppSync Repro *
+ ********************/
+
+interface L2NestedResolverStackProps extends NestedStackProps {
+  shouldCreateResolver: boolean;
+  api: IGraphqlApi;
+  dataSource: BaseDataSource;
+  persistentFieldName: string;
 }
 
-class NestedQueueStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props: NestedQueueStackProps) {
+class L2NestedResolverStack extends NestedStack {
+  constructor(scope: Construct, id: string, props: L2NestedResolverStackProps) {
     super(scope, id, props);
 
-    if (props.shouldCreateResource) createQueue(this);
+    new l2appsync.Resolver(this, `AttachedResolver${props.persistentFieldName}`, {
+      api: props.api,
+      dataSource: props.dataSource,
+      typeName: 'Query',
+      fieldName: props.persistentFieldName,
+      requestMappingTemplate: MappingTemplate.fromString('{}'),
+      responseMappingTemplate: MappingTemplate.fromString('$util.toJson({})'),
+    });
+
+    if (props.shouldCreateResolver) {
+      new l2appsync.Resolver(this, `AttachedResolverrunQuery`, {
+        api: props.api,
+        dataSource: props.dataSource,
+        typeName: 'Query',
+        fieldName: 'runQuery',
+        requestMappingTemplate: MappingTemplate.fromString('{}'),
+        responseMappingTemplate: MappingTemplate.fromString('$util.toJson({})'),
+      });
+    }
   }
 }
 
-class EventStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+class L2AppSyncStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
 
-    new NestedQueueStack(this, 'NestedQueueStackA', {
+    const api = new l2appsync.GraphqlApi(this, 'API', {
+      name: 'cdkBasedAPI',
+      authorizationConfig: {
+        defaultAuthorization: {
+          authorizationType: AuthorizationType.API_KEY
+        }
+      },
+      schema: Schema.fromAsset(path.join(__dirname, '..', 'assets', 'schema.graphql')),
+    });
+
+    const dataSource = new l2appsync.NoneDataSource(this, 'DataSource', {
+      api,
+      name: 'NONE_DS',
+    });
+
+    new L2NestedResolverStack(this, 'L2NestedResolverStackA', {
+      shouldCreateResolver: IS_INITIAL_STATE,
+      api,
+      dataSource,
+      persistentFieldName: 'stackAQuery',
+    });
+    new L2NestedResolverStack(this, 'L2NestedResolverStackB', {
+      shouldCreateResolver: !IS_INITIAL_STATE,
+      api,
+      dataSource,
+      persistentFieldName: 'stackBQuery',
+    });
+  }
+}
+
+/***************
+ * L1 S3 Repro *
+ ***************/
+
+interface NestedQueueStackProps extends NestedStackProps {
+  shouldCreateResource: boolean;
+}
+
+class L1NestedBucketStack extends NestedStack {
+  constructor(scope: Construct, id: string, props: NestedQueueStackProps) {
+    super(scope, id, props);
+
+    if (props.shouldCreateResource) new s3.CfnBucket(this, 'Bucket', {
+      bucketName: 'alharris-test-bucket123123',
+    });
+  }
+}
+
+class L1BucketStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
+    super(scope, id, props);
+
+    new L1NestedBucketStack(this, 'L1NestedBucketStackA', {
       shouldCreateResource: IS_INITIAL_STATE,
     });
-    new NestedQueueStack(this, 'NestedQueueStackB', {
+    new L1NestedBucketStack(this, 'L1NestedBucketStackB', {
       shouldCreateResource: !IS_INITIAL_STATE,
     });
   }
 }
 
-const app = new cdk.App();
+/***************
+ * L2 S3 Repro *
+ ***************/
 
-new AppSyncStack(app, 'AppSyncStack', {});
-new EventStack(app, 'EventStack', {});
+class L2NestedBucketStack extends NestedStack {
+  constructor(scope: Construct, id: string, props: NestedQueueStackProps) {
+    super(scope, id, props);
+
+    if (props.shouldCreateResource) new s3.Bucket(this, 'L2Bucket', {
+      bucketName: 'alharris-test-bucket987987',
+    });
+  }
+}
+
+class L2BucketStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
+    super(scope, id, props);
+
+    new L2NestedBucketStack(this, 'L2NestedBucketStackA', {
+      shouldCreateResource: IS_INITIAL_STATE,
+    });
+    new L2NestedBucketStack(this, 'L2NestedBucketStackB', {
+      shouldCreateResource: !IS_INITIAL_STATE,
+    });
+  }
+}
+
+const app = new App();
+
+new L1AppSyncStack(app, 'L1AppSyncStack', {});
+new L2AppSyncStack(app, 'L2AppSyncStack', {});
+new L1BucketStack(app, 'L1BucketStack', {});
+new L2BucketStack(app, 'L2BucketStack', {});
